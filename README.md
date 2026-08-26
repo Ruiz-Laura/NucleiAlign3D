@@ -1,16 +1,386 @@
-Three-dimensional image stacks were acquired and processed. Nuclear segmentation was provided as labeled volumetric masks, in which each nucleus was assigned a unique identifier. In parallel, a second volumetric signal corresponding to a structural tissue axis (referred to here as the X-axis signal) was used to define a global geometric reference.
-To facilitate analysis, two-dimensional projections were generated from the 3D data. A maximum intensity projection of the nuclear mask was used to visualize cell distribution, while a sum projection along the Z-axis of the X-axis signal was computed to obtain a continuous representation of the tissue structure. This projected signal was thresholded to produce a binary mask, followed by hole filling to ensure continuity. To stabilize contour detection, the binary mask was optionally eroded by a small number of pixels, effectively shifting the contour inward and reducing edge irregularities.
-The external boundary of the X-axis structure was extracted using a contour detection algorithm, and only the longest contour above a minimum length threshold was retained. This contour was then smoothed using a circular moving average filter to reduce local fluctuations and generate a continuous, well-defined curve suitable for geometric analysis.
-For each nucleus, the principal axis of elongation was computed using principal component analysis (PCA) applied to the three-dimensional voxel coordinates. The first principal component, corresponding to the direction of maximum variance, was defined as the nuclear long axis. Nuclei with insufficient voxel counts or poorly defined principal axes were excluded from further analysis. The centroid of each nucleus was calculated and projected into the two-dimensional imaging plane.
-To define a local tissue reference direction, the closest point on the smoothed X-axis contour was identified for each nucleus using a nearest-neighbor search. This initial anchor point was refined by searching within a local region for the position of maximum signal intensity in the X-axis projection, ensuring robust localization of the structural axis. The final anchor point was then used to compute a local tangent vector along the contour, based on neighboring contour points separated by a fixed window. This tangent vector was normalized and oriented toward a predefined base point within the image, ensuring consistent directional polarity across samples.
+Overview
 
-Because PCA does not intrinsically define vector orientation, the nuclear long axis was further oriented relative to a user-defined reference line. This line, defined along either the X or Y axis at a specified coordinate, provided a global polarity cue. The nuclear axis was oriented such that it pointed toward this reference line, thereby enforcing a consistent spatial convention across all nuclei. In cases where the angle between the nuclear axis and the local tangent was below a defined threshold (10 degrees), the nuclear axis orientation was corrected to align with the tangent direction, preventing instability in near-parallel configurations.
-The angle between the oriented nuclear axis and the local tangent was then computed in the imaging plane using the dot product formulation and expressed in degrees between 0 and 180. This metric captures the degree of alignment between individual nuclei and the local tissue geometry.
-To visualize the results, multiple representations were generated, including maps of nuclear orientations overlaid on the tissue projection, single-cell zoomed views illustrating vector relationships, and polar histograms showing the global distribution of angles. Summary statistics, including mean and standard deviation of angular distributions, were also computed.
+This analysis pipeline quantifies the orientation of cell nuclei relative to a global tissue axis and measures the degree of orientational coordination between neighboring cells.
 
-Analysis of local alignment between neighboring cells
+The workflow starts from 3D volumetric microscopy data containing:
 
-To assess spatial coordination of nuclear orientation, a nearest-neighbor analysis was performed in three dimensions. Nuclear centroids were used to construct a spatial index, and neighboring cells were defined as those located within a fixed distance threshold (110 pixels). This threshold was empirically determined by manually estimating the number of neighboring nuclei for representative cells in the 3D images and comparing these observations with the number of neighbors identified computationally. The distance parameter was adjusted iteratively until the automated detection matched the manually observed neighborhood size. For each nucleus and its neighbors, principal axes were computed independently using principal component analysis (PCA) and normalized to unit vectors.
-Alignment between neighboring nuclei was quantified using the absolute value of the dot product between their respective principal axes. This metric ranges from 0, corresponding to perpendicular orientations, to 1, indicating perfect alignment. Based on this value, cell pairs were classified into three categories: parallel (>0.8), nonparallele (<0.8).
-The distribution of alignment categories across all neighboring pairs was computed to quantify the degree of local orientational coherence within the tissue. All pairwise measurements were recorded and exported for downstream statistical analysis.
-All analyses were performed using custom Python scripts relying on standard scientific computing libraries, including NumPy, SciPy, scikit-learn, scikit-image, and Matplotlib. These tools were used for image processing, geometric analysis, vector computation, and data visualizati.
+A labeled nuclear segmentation, where each nucleus has a unique integer label.
+A second 3D image representing a structural tissue axis, referred to as the X-axis signal.
+
+The analysis combines 3D nuclear geometry with a 2D representation of the tissue structure. For each nucleus, the pipeline determines:
+
+- The position of the nucleus.
+- Its principal axis of elongation.
+- The local direction of the tissue axis.
+- The angle between the nuclear axis and the tissue axis.
+- The orientation of neighboring nuclei.
+- The degree of alignment between neighboring nuclei.
+
+
+1. Input Data
+
+The pipeline requires two volumetric images with Nuclear segmentation tha allow to get the fisrt input as a 3D labeled segmentation mask.
+
+Each nucleus is represented by a unique integer value:
+
+0 = background
+1 = nucleus 1
+2 = nucleus 2
+3 = nucleus 3
+...
+
+The coordinates of all voxels belonging to each nucleus are extracted from this volume.
+
+
+The second input is a 3D intensity volume representing the structural axis of the tissue. (also segmented)
+
+This signal is used to establish a geometric reference against which nuclear orientation can be measured.
+
+
+
+2. Generation of 2D Tissue Projections
+
+Although the original data are 3D, the tissue axis is analyzed in the 2D imaging plane.
+
+Nuclear projection is obtained thanks to a maximum-intensity projection of the nuclear segmentation 
+This provides a 2D visualization of the spatial distribution of the nuclei.
+
+Conceptually:
+
+nuclear_projection = np.max(nuclear_mask, axis=0)
+
+This projection is primarily used for visualization and for displaying nuclear orientation vectors.
+
+
+The X-axis signal is instead summed along Z:
+
+x_projection = np.sum(x_signal, axis=0)
+
+Using a sum projection preserves information about the total structural signal along the Z direction.
+
+The resulting image represents the tissue axis as a continuous 2D intensity distribution.
+
+3. Detection of the Tissue Axis
+
+The projected X-axis signal is converted into a binary mask.
+
+Thresholding
+
+Pixels above a selected intensity threshold are classified as belonging to the X-axis structure:
+
+X-axis projection
+       │
+       ▼
+   Threshold
+       │
+       ▼
+ Binary mask
+Hole filling
+
+Small holes inside the binary structure are filled to produce a more continuous region.
+
+This is important because discontinuities in the binary mask can lead to fragmented or unstable contours.
+
+Optional erosion
+
+The binary mask can optionally be eroded by a small number of pixels.
+
+Erosion moves the detected boundary slightly inward and can reduce irregularities caused by noisy edges.
+
+4. Contour Extraction and Smoothing
+
+The external contours of the binary tissue mask are detected.
+
+If several contours are present, the pipeline retains the longest contour above a predefined minimum length.
+
+This removes small disconnected structures and focuses the analysis on the main tissue axis.
+
+The selected contour is then smoothed using a circular moving-average filter.
+
+The purpose of smoothing is to remove small local fluctuations while preserving the overall geometry of the tissue boundary.
+
+The result is a continuous 2D curve:
+
+Raw contour
+     │
+     ▼
+Moving-average smoothing
+     │
+     ▼
+Smoothed tissue contour
+
+This smoothed contour becomes the geometric reference used to calculate the local tissue direction.
+
+5. Nuclear Principal Axis Using PCA
+
+For every segmented nucleus, all 3D voxel coordinates are extracted.
+
+For example:
+
+(x1, y1, z1)
+(x2, y2, z2)
+(x3, y3, z3)
+...
+
+These coordinates are analyzed using Principal Component Analysis (PCA).
+
+PCA identifies the direction in which the nuclear voxel coordinates have the greatest variance.
+
+The first principal component is therefore used as the nuclear long axis.
+
+Conceptually:
+
+Nuclear voxel coordinates
+          │
+          ▼
+         PCA
+          │
+          ├── PC1 → nuclear long axis
+          ├── PC2 → secondary axis
+          └── PC3 → third axis
+
+The first principal component is normalized to a unit vector.
+
+Nuclei with too few voxels or poorly defined PCA results are excluded because their orientation cannot be determined reliably.
+
+6. Nuclear Centroids
+
+The centroid of each nucleus is calculated from its voxel coordinates.
+
+The 3D centroid is then projected into the 2D imaging plane.
+
+This projected centroid is used to associate each nucleus with its nearest location on the tissue contour.
+
+7. Finding the Local Tissue Direction
+
+For each nucleus, the closest point on the smoothed tissue contour is initially identified using a nearest-neighbor search.
+
+However, the geometrically closest point is not necessarily the best representation of the biological tissue axis.
+
+Therefore, the pipeline performs a local refinement.
+
+Within a defined region around the initial contour point, the X-axis projection is searched for the location with the highest signal intensity.
+
+This allows the contour anchor to be adjusted toward the strongest structural signal.
+
+The final point is used as the local reference position for that nucleus.
+
+8. Calculation of the Local Tissue Tangent
+
+Once the local anchor point is determined, the direction of the tissue axis is estimated from neighboring points along the smoothed contour.
+
+A fixed contour window is used:
+
+Contour points:
+
+       previous points
+             ↓
+------●--●--●--●--●------
+          ↑
+      anchor point
+
+A vector between points on either side of the anchor is calculated.
+
+This vector approximates the local tangent to the tissue contour.
+
+The tangent is normalized to a unit vector.
+
+Because a vector has two possible directions, the tangent is then oriented consistently toward a predefined base point.
+
+This ensures that all tissue-axis vectors have the same polarity across the image.
+
+9. Orientation of the Nuclear Axis
+
+PCA determines an axis but does not determine which direction along that axis should be considered positive.
+
+For example, PCA may return:
+
+       ←────────→
+       nuclear axis
+
+Both directions describe exactly the same PCA axis.
+
+To obtain a consistent direction, the nuclear axis is oriented relative to a user-defined reference line.
+
+The reference line can be positioned along either the X or Y image axis at a specified coordinate.
+
+The nuclear vector is flipped when necessary so that it points toward the selected reference line.
+
+This provides a consistent polarity convention across nuclei and samples.
+
+10. Special Handling of Nearly Parallel Orientations
+
+The angle between the nuclear axis and the local tissue tangent is normally calculated after both vectors have been oriented.
+
+However, when the two vectors are almost parallel, small numerical or contour variations can produce unstable orientation decisions.
+
+The pipeline therefore uses a 10° threshold.
+
+If the angular difference is less than 10°, the nuclear axis orientation is corrected to match the local tissue tangent.
+
+This prevents artificial orientation flips in cases where the nuclear and tissue axes are already nearly parallel.
+
+11. Nuclear–Tissue Alignment Angle
+
+The angle between the nuclear long axis and the local tissue tangent is calculated using their normalized dot product.
+
+For two unit vectors:
+
+n = nuclear axis
+t = tissue tangent
+
+the angle is calculated as:
+
+θ = arccos(n · t)
+
+and converted from radians to degrees.
+
+The resulting angle ranges from:
+
+0°   → parallel
+90°  → perpendicular
+180° → opposite direction
+
+Thus, the angle provides a measure of how each nucleus is oriented relative to the local tissue geometry.
+
+12. Visualization
+
+Several visualization outputs are generated.
+
+Nuclear orientation map
+
+Nuclear centroids are displayed over the X-axis projection.
+
+A vector representing the nuclear long axis is plotted at each nucleus.
+
+The local tissue tangent can also be plotted for comparison.
+
+This provides a spatial representation of how nuclear orientation changes throughout the tissue.
+
+Individual cell visualization
+
+Selected nuclei can be visualized at higher magnification.
+
+These plots show:
+
+Nuclear position
+Nuclear long axis
+Local tissue tangent
+Relative angle between the two vectors
+
+This is useful for visually validating the orientation calculation.
+
+Angular distribution
+
+The measured nuclear–tissue angles are summarized using a polar histogram.
+
+This provides an overview of the global orientation distribution.
+
+Mean and standard deviation are also calculated as summary statistics.
+
+13. Neighboring Cell Alignment
+
+A separate analysis measures whether neighboring nuclei tend to have similar orientations.
+
+Unlike the tissue-axis analysis, this calculation is performed directly in 3D.
+
+The 3D nuclear centroids are used to construct a spatial search structure.
+
+For each nucleus, neighboring nuclei are identified within a distance threshold of:
+
+110 pixels
+
+The 110-pixel threshold was empirically selected by comparing automatically detected neighbors with manually observed neighborhoods in representative 3D images.
+
+The threshold can therefore be modified depending on image resolution and tissue density.
+
+14. Pairwise Nuclear Alignment
+
+For each neighboring pair of nuclei, the 3D PCA orientation is calculated independently.
+
+The two principal-axis vectors are normalized:
+
+|v1| = 1
+|v2| = 1
+
+Their alignment is then calculated using the absolute dot product:
+
+alignment = |v1 · v2|
+
+The absolute value is important because PCA axes have no intrinsic polarity.
+
+For example:
+
+→────────→
+
+and
+
+←────────←
+
+represent the same physical orientation.
+
+Therefore, both should be considered aligned.
+
+The resulting alignment score ranges from:
+
+0 = perpendicular
+1 = perfectly aligned
+15. Classification of Neighboring Cells
+
+Neighboring pairs are classified according to their alignment score.
+
+The current threshold is:
+
+alignment > 0.8
+
+Pairs above this threshold are classified as parallel/aligned.
+
+Pairs below the threshold are classified as non-parallel.
+
+The analysis therefore converts continuous orientation information into a simple categorical measure of local orientational coherence.
+
+16. Output Data
+
+The pipeline exports the measurements required for downstream statistical analysis.
+
+Depending on the implementation, these measurements can include:
+
+Per-nucleus measurements
+Nuclear ID
+3D centroid
+2D centroid
+PCA long-axis vector
+Local tissue-axis position
+Local tissue tangent
+Nuclear–tissue angle
+Quality-control information
+Per-neighbor-pair measurements
+Nuclear ID 1
+Nuclear ID 2
+3D distance
+PCA vector of nucleus 1
+PCA vector of nucleus 2
+Alignment score
+Alignment category
+
+These tables can subsequently be analyzed using Python, R, MATLAB, or other statistical software.
+
+17. Software
+
+The analysis is implemented in Python using standard scientific computing and image-processing libraries.
+
+The main dependencies are:
+
+NumPy
+SciPy
+scikit-image
+scikit-learn
+Matplotlib
+
+These libraries are used for:
+
+NumPy — numerical operations and array manipulation
+SciPy — spatial searches, filtering, and geometric calculations
+scikit-image — image processing, segmentation, morphology, and contour detection
+scikit-learn — PCA
+Matplotlib — visualization and plotting
