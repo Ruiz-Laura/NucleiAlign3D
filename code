@@ -1,0 +1,978 @@
+import numpy as np
+import tifffile as tiff
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from scipy.spatial import KDTree
+import os
+import matplotlib.cm as cm
+import pandas as pd
+import sys
+import math
+from skimage import measure
+from skimage.morphology import disk
+from scipy.spatial import KDTree
+from scipy.ndimage import binary_fill_holes, binary_erosion
+
+# ====================================================================
+# CONFIGURATION & PARAMÈTRES (VALEURS PAR DÉFAUT)
+# ====================================================================
+# --- CHEMINS DE FICHIERS (À MODIFIER) ---
+path = r"E:\Papiers\Matis\segmentation\ctrl 05.11.2025\2 1-1"
+# NOUVEAU dossier de sortie pour la version avec Grosses Flèches et colormap RdBu_r
+output_dir = os.path.join(path, "figures_output_CALCUL_AXE_LONG_V22_FLECHES_TRES_EPAISSES") 
+os.makedirs(output_dir, exist_ok=True)
+mask_file = os.path.join(path, "CTL myo2A lysozyme 63X zoom 2 1-1_cp_masks corrected.tif")
+axe_x_file = os.path.join(path, "CTL myo2A lysozyme 63X zoom 2 1-1_ axeX.tif")
+
+# --- PARAMÈTRES FIXES ET DE BASE ---
+VISUAL_VECTOR_LENGTH = 10  # Facteur d'échelle pour les flèches (plus petit = plus long)
+NB_BINS = 18
+ANGLE_CORRECTION_THRESHOLD = 10.0 # Seuil de l'angle pour forcer l'orientation PCA par la Tangente X
+
+# --- PARAMÈTRES DU BASE POINT (BP) - Orientation Tangente X ---
+DEFAULT_BP_X = 125.0
+DEFAULT_BP_Y = 50.0
+BASE_POINT = np.array([DEFAULT_BP_X, DEFAULT_BP_Y]) # [X, Y]
+
+# --- PARAMÈTRES DE LA LIGNE DE RÉFÉRENCE (RL) - Orientation Axe Long ---
+DEFAULT_RL_AXIS = 2 # 1 pour Y, 2 pour X
+REFERENCE_LINE_AXIS = DEFAULT_RL_AXIS
+REFERENCE_LINE_VALUE = None
+FIXED_Z_COORD = None # Z pour la projection de l'axe long 3D
+
+# --- PARAMÈTRES DU LISSAGE ET DU CONTOUR ---
+NEW_DECALAGE_PIXEL = 1              # Décalage dans le noir (pixel = 0)
+SMOOTHING_CONTOUR_WINDOW = 5        # Fenêtre de lissage (contour fermé)
+THRESHOLD_VALUE = 0.1
+MIN_CONTOUR_LENGTH = 50
+
+# --- PARAMÈTRES D'ANALYSE DYNAMIQUES ---
+DEFAULT_TANGENT_WINDOW_SIZE = 15    # Taille de la fenêtre de points pour calculer la tangente
+TANGENT_WINDOW_SIZE = DEFAULT_TANGENT_WINDOW_SIZE
+DEFAULT_TANGENT_ROI_SIZE = 100      # Taille de la région autour du centre pour trouver l'ancre (Intensité Max)
+TANGENT_ROI_SIZE = DEFAULT_TANGENT_ROI_SIZE
+
+# LABEL CHOISI PAR L'UTILISATEUR
+label_to_check = None
+
+# ====================================================================
+# FONCTIONS DE LISSAGE ET D'EXTRACTION DE CONTOUR
+# ====================================================================
+def smooth_coords(coords, window_size):
+    """Applique une moyenne glissante pour lisser et régulariser le contour (fermé)."""
+    N = coords.shape[0]
+    if N < window_size or window_size <= 1:
+        return coords
+
+    pad_len = window_size // 2
+    end_pad = pad_len - (window_size % 2 == 0)
+
+    coords_x_padded = np.pad(coords[:, 0], (pad_len, end_pad), mode='wrap')
+    coords_y_padded = np.pad(coords[:, 1], (pad_len, end_pad), mode='wrap')
+
+    kernel = np.ones(window_size) / window_size
+    x_smoothed = np.convolve(coords_x_padded, kernel, mode='valid')
+    y_smoothed = np.convolve(coords_y_padded, kernel, mode='valid')
+
+    min_len = min(N, len(x_smoothed))
+    return np.vstack((x_smoothed[:min_len], y_smoothed[:min_len])).T
+
+def get_external_shifted_contour_curve(image_projection, threshold_value, shift_pixels, min_contour_length, smoothing_window):
+    """
+    Détecte le contour externe décalé, sélectionne le plus long et applique le lissage.
+    """
+    binary_image = image_projection > threshold_value
+    binary_image = binary_fill_holes(binary_image)
+
+    if shift_pixels > 0:
+        selem = disk(shift_pixels)
+        shifted_binary_image = binary_erosion(binary_image, selem)
+    else:
+        shifted_binary_image = binary_image
+
+    contours = measure.find_contours(shifted_binary_image, 0.5)
+
+    if not contours:
+        return np.zeros((0,2))
+
+    longest_contour = None
+    max_length = 0
+
+    for contour in contours:
+        contour_xy = contour[:, [1, 0]]
+        if len(contour_xy) > min_contour_length:
+            if len(contour_xy) > max_length:
+                max_length = len(contour_xy)
+                longest_contour = contour_xy
+
+    if longest_contour is None:
+        return np.zeros((0,2))
+
+    if smoothing_window > 1:
+        longest_contour = smooth_coords(longest_contour, smoothing_window)
+
+    return longest_contour
+
+# ====================================================================
+# FONCTIONS D'ANALYSE
+# ====================================================================
+def get_principal_axes_3D_only(coords):
+    """Calcule le centre et le vecteur PCA principal (3D) SANS orientation. Coords [Z, Y, X]."""
+    if len(coords) < 4: return np.zeros(3), np.zeros(3)
+    pca = PCA(n_components=3)
+    try:
+        pca.fit(coords)
+        if pca.explained_variance_ratio_[0] < 0.1 or pca.explained_variance_[0] < 1e-6:
+             return np.zeros(3), np.zeros(3)
+
+        center = np.mean(coords, axis=0)
+        v_pca = pca.components_[0]
+        
+        return center, v_pca
+    except Exception:
+        return np.zeros(3), np.zeros(3)
+
+def calculate_angle_0_180_rl_oriented(center_2D, v_pca_3D, reference_line_axis, reference_line_value, base_point, kd_tree_axe_x_lissé, coords_axe_x_xy_lissé, TANGENT_WINDOW_SIZE, proj_axe_x_z, TANGENT_ROI_SIZE, height, width):
+    """
+    Calcule l'angle non orienté [0° à 180°] entre la Tangente X et le Pôle PCA,
+    où le Pôle PCA est orienté en fonction de la Ligne de Référence (RL).
+    Retourne également le PCA orienté par la Tangente X (v_pca_orienté_tangente) pour la correction.
+    """
+    # Si données insuffisantes
+    if coords_axe_x_xy_lissé.size == 0 or kd_tree_axe_x_lissé is None:
+        v_default = np.array([1.0, 0.0])
+        # Retourne 6 valeurs: (angle, intersection, v_tangente, v_pca_rl, v_ref_orient, v_pca_tangente)
+        return 0.0, center_2D, v_default, v_default, v_default, v_default 
+
+    # 1. ANCRAGE DE LA TANGENTE X (inchangé)
+    i_pixel_initial = kd_tree_axe_x_lissé.query(center_2D)[1]
+    intersection_initial = coords_axe_x_xy_lissé[i_pixel_initial]
+    
+    roi_size = TANGENT_ROI_SIZE
+    x_int, y_int = intersection_initial.astype(int)
+    x_min, x_max = max(0, x_int - roi_size // 2), min(width, x_int + roi_size // 2 + 1)
+    y_min, y_max = max(0, y_int - roi_size // 2), min(height, y_int + roi_size // 2 + 1)
+    roi = proj_axe_x_z[y_min:y_max, x_min:x_max]
+
+    if roi.size > 0 and roi.max() > 0:
+        max_intensity_idx = np.unravel_index(np.argmax(roi), roi.shape)
+        max_intensity_point = np.array([x_min + max_intensity_idx[1], y_min + max_intensity_idx[0]])
+    else:
+        max_intensity_point = intersection_initial
+
+    i_pixel_final_anchor = kd_tree_axe_x_lissé.query(max_intensity_point)[1]
+    intersection_exact = coords_axe_x_xy_lissé[i_pixel_final_anchor]
+
+    # 2. CALCUL ET ORIENTATION DE LA TANGENTE X (VERS le BP - inchangé)
+    window_size = TANGENT_WINDOW_SIZE
+    N_lissé = len(coords_axe_x_xy_lissé)
+    idx_prev = (i_pixel_final_anchor - window_size) % N_lissé
+    idx_next = (i_pixel_final_anchor + window_size) % N_lissé
+    v_tangent_unnorm = (coords_axe_x_xy_lissé[idx_next] - coords_axe_x_xy_lissé[idx_prev]).astype(float)
+    norm_tangent = np.linalg.norm(v_tangent_unnorm)
+    v_tangent_initial_norm = v_tangent_unnorm / norm_tangent if norm_tangent > 1e-6 else np.array([1.0, 0.0])
+
+    v_intersection_to_bp = base_point - intersection_exact
+    v_tangent_orienté = v_tangent_initial_norm
+    if np.dot(v_tangent_initial_norm, v_intersection_to_bp) < 0:
+        v_tangent_orienté = -v_tangent_initial_norm
+
+    # Projection 2D et normalisation du PCA 3D
+    v_pca_2D = v_pca_3D[[2, 1]] # Extrait X et Y (indices 2 et 1 du format [Z, Y, X])
+    norm_pca = np.linalg.norm(v_pca_2D)
+    v_pca_initial_norm = v_pca_2D / norm_pca if norm_pca > 1e-6 else np.array([1.0, 0.0])
+    
+    
+    # 3. PÔLE PCA ORIENTÉ PAR LA LIGNE DE RÉFÉRENCE (RL) [LOGIQUE PRINCIPALE]
+    
+    coord_index_2D = 0 if reference_line_axis == 2 else 1 
+    center_coord = center_2D[coord_index_2D]
+    center_rl_diff = center_coord - reference_line_value
+    
+    # Vecteur d'orientation souhaité : LOIN de la Ligne de Référence (RL)
+    v_desired_orientation = np.zeros(2)
+    if coord_index_2D == 0: 
+        v_desired_orientation[0] = -np.sign(center_rl_diff) if abs(center_rl_diff) > 1e-6 else 1.0 
+    else: 
+        v_desired_orientation[1] = -np.sign(center_rl_diff) if abs(center_rl_diff) > 1e-6 else 1.0 
+        
+    v_pca_orienté_rl = v_pca_initial_norm.copy()
+    if np.dot(v_pca_initial_norm, v_desired_orientation) < 0:
+        v_pca_orienté_rl = -v_pca_orienté_rl
+        
+    v_reference_orientation = v_desired_orientation
+
+
+    # 3b. PÔLE PCA ORIENTÉ PAR LA TANGENTE X / BP [LOGIQUE DE SECOURS/CORRECTION]
+    # On oriente le PCA dans la même direction que la Tangente X (orientée vers BP)
+    v_pca_orienté_tangente = v_pca_initial_norm.copy()
+    if np.dot(v_pca_initial_norm, v_tangent_orienté) < 0:
+        v_pca_orienté_tangente = -v_pca_orienté_tangente
+
+
+    # 4. CALCUL DE L'ANGLE NON ORIENTÉ [0°, 180°] (entre Tangente orientée et PCA orienté par RL)
+    dot_prod = np.dot(v_tangent_orienté, v_pca_orienté_rl)
+    angle_deg_0_180 = np.degrees(np.arccos(np.clip(dot_prod, -1.0, 1.0)))
+
+    return (angle_deg_0_180, intersection_exact,
+            v_tangent_orienté, v_pca_orienté_rl, v_reference_orientation, v_pca_orienté_tangente) 
+
+# ====================================================================
+# DATA LOADING & PRE-DISPLAY 
+# ====================================================================
+print("---Chargement des volumes TIFF...")
+try:
+    mask_vol = tiff.imread(mask_file)
+    axe_x_vol = tiff.imread(axe_x_file)
+    proj_mask = np.max(mask_vol, axis=0)
+    proj_axe_x_z = np.sum(axe_x_vol, axis=0)
+    height, width = proj_axe_x_z.shape
+    depth = axe_x_vol.shape[0]
+
+    # Calcul du contour lissé
+    coords_axe_x_xy_lissé = get_external_shifted_contour_curve(
+        proj_axe_x_z, THRESHOLD_VALUE, NEW_DECALAGE_PIXEL, MIN_CONTOUR_LENGTH, SMOOTHING_CONTOUR_WINDOW
+    )
+
+    if coords_axe_x_xy_lissé.size == 0:
+        print(" Échec de l'extraction du contour lissé de l'Axe X. Sortie.")
+        sys.exit(1)
+
+    kd_tree_axe_x = KDTree(coords_axe_x_xy_lissé)
+except Exception as e:
+    print(f" Erreur de chargement ou de préparation: {e}")
+    sys.exit(1)
+print("--- Volumes chargés. (Axe X LISSÉ utilisé pour la tangente)")
+
+unique_labels = np.unique(mask_vol)
+unique_labels = unique_labels[unique_labels != 0]
+
+# --- AFFICHAGE INITIAL DE LA PROJECTION 2D (Figure 1 de Référence) ---
+fig_ref, ax_ref = plt.subplots(figsize=(10,10))
+ax_ref.imshow(proj_axe_x_z, cmap='gray', origin='lower', extent=[0, width, 0, height])
+ax_ref.plot(coords_axe_x_xy_lissé[:, 0], coords_axe_x_xy_lissé[:, 1], color='magenta', linewidth=2.5, zorder=5, label='Contour Lissé')
+ax_ref.scatter(DEFAULT_BP_X, DEFAULT_BP_Y, color='lime', s=200, marker='*', edgecolors='black', zorder=10, label=f'Base Point (BP) Défaut')
+ax_ref.set_title("Projection 2D de l'Axe X (Intensités Somme sur Z)", fontsize=14)
+ax_ref.axis("equal"); ax_ref.legend(loc='lower left', fontsize=10)
+plt.tight_layout()
+# NOTE: L'affichage de cette figure est en mode bloquant pour permettre la saisie utilisateur ensuite.
+plt.show(block=True) 
+plt.close(fig_ref)
+# 
+
+# ====================================================================
+# --- SAISIE UTILISATEUR DES PARAMÈTRES D'ORIENTATION ---
+# ====================================================================
+CURRENT_TANGENT_WINDOW_SIZE = DEFAULT_TANGENT_WINDOW_SIZE
+bp_x = DEFAULT_BP_X
+bp_y = DEFAULT_BP_Y
+REFERENCE_LINE_AXIS = DEFAULT_RL_AXIS
+REFERENCE_LINE_VALUE = None
+FIXED_Z_COORD = None
+
+
+try:
+    # --- CHOIX DU LABEL À INSPECTER (1) ---
+    print(f"\n--- Choix du Label pour l'inspection (Figures 2 & 3) ---")
+    default_label = unique_labels[0] if unique_labels.size > 0 else 1
+    labels_str = ", ".join(map(str, unique_labels))
+    label_input = input(f"Labels disponibles: ({labels_str}). Entrez le Label à inspecter (Défaut: {default_label}): ")
+
+    try:
+        label_to_check = int(label_input)
+        if label_to_check not in unique_labels:
+            print(f"Label {label_to_check} non valide. Utilisation du défaut: {default_label}.")
+            label_to_check = default_label
+    except ValueError:
+        print(f"Entrée non numérique. Utilisation du défaut: {default_label}.")
+        label_to_check = default_label
+    print(f"\n Focalisation sur le **Label {label_to_check}** pour les figures de zoom.")
+
+
+    # --- PARAMÈTRES DU BASE POINT (BP) - Orientation Tangente X ---
+    print(f"\n---  Base Point (BP - pour orienter la Tangente X) ---")
+    bp_x_str = input(f"Entrez la coordonnée X du Base Point (0-{width-1}, défaut {DEFAULT_BP_X:.0f}): ")
+    bp_y_str = input(f"Entrez la coordonnée Y du Base Point (0-{height-1}, défaut {DEFAULT_BP_Y:.0f}): ")
+
+    bp_x = float(bp_x_str) if bp_x_str else DEFAULT_BP_X
+    bp_y = float(bp_y_str) if bp_y_str else DEFAULT_BP_Y
+
+    if 0 <= bp_x < width and 0 <= bp_y < height:
+        BASE_POINT = np.array([bp_x, bp_y])
+    else:
+        print(f" Coordonnées du Base Point invalides. Utilisation du défaut: ({DEFAULT_BP_X:.0f}, {DEFAULT_BP_Y:.0f}).")
+        BASE_POINT = np.array([DEFAULT_BP_X, DEFAULT_BP_Y])
+
+    # --- PARAMÈTRES DE LA LIGNE DE RÉFÉRENCE (RL) POUR ORIENTATION AXE LONG ---
+    print(f"\n---  Ligne de Référence (RL - pour orienter l'Axe Long) ---")
+
+    # 1. Choix de l'axe (X ou Y)
+    rl_axis_input = input("1) Entrez l'axe de la Ligne de Référence (X ou Y; Défaut X) : ").upper()
+    
+    if rl_axis_input == 'Y':
+        REFERENCE_LINE_AXIS = 1 # 1 = Y
+        rl_label = 'Y'
+        max_coord = height - 1
+    elif rl_axis_input == 'X' or not rl_axis_input:
+        REFERENCE_LINE_AXIS = 2 # 2 = X (Défaut)
+        rl_label = 'X'
+        max_coord = width - 1
+    else:
+        print(f" Axe invalide. Utilisation du défaut: X.")
+        REFERENCE_LINE_AXIS = 2
+        rl_label = 'X'
+        max_coord = width - 1
+        
+    # 2. Saisie de la coordonnée
+    rl_value_str = input(f"2) Entrez la VALEUR de la coordonnée {rl_label} de la Ligne de Référence (0 - {max_coord}) : ")
+    
+    REFERENCE_LINE_VALUE = float(rl_value_str)
+    if not (0 <= REFERENCE_LINE_VALUE <= max_coord):
+        raise ValueError("Valeur RL hors limites.")
+    print(f"Ligne de Référence (RL) fixée à : **{rl_label} = {REFERENCE_LINE_VALUE:.2f}**.")
+    
+    # 3. Saisie de la coordonnée Z (nécessaire pour la projection 3D)
+    rp_z_default = depth // 2
+    if axe_x_vol.ndim >= 3:
+        z_max = depth - 1
+        z_input = input(f"Entrez la coordonnée Z à utiliser pour la projection (0 - {z_max}; Défaut: Milieu {rp_z_default}): ")
+        
+        try:
+            FIXED_Z_COORD = int(z_input)
+            if not (0 <= FIXED_Z_COORD <= z_max):
+                print(f" Coordonnée Z invalide. Utilisation du défaut : {rp_z_default}.")
+                FIXED_Z_COORD = rp_z_default
+        except ValueError:
+            print(f" Entrée non numérique. Utilisation du défaut : {rp_z_default}.")
+            FIXED_Z_COORD = rp_z_default
+    else:
+        FIXED_Z_COORD = 0
+        
+    print(f"Le point de référence de l'axe (pour l'affichage) utilisera Z = **{FIXED_Z_COORD}**.")
+
+    # 4. Saisie de la fenêtre de tangente
+    print(f"\n---  Ajustement de la Tangente X (sur ligne LISSÉE) ---")
+    window_input = input(f"Entrez la taille de la fenêtre de la tangente (Plus grand = plus lisse; défaut {CURRENT_TANGENT_WINDOW_SIZE}): ")
+
+    if window_input:
+        new_window_size = int(window_input)
+        if new_window_size > 0:
+            CURRENT_TANGENT_WINDOW_SIZE = new_window_size
+    TANGENT_WINDOW_SIZE = CURRENT_TANGENT_WINDOW_SIZE
+    print(f"Taille de la fenêtre de tangente ajustée à : {TANGENT_WINDOW_SIZE}.")
+    
+    if REFERENCE_LINE_VALUE is None:
+        raise ValueError("La Ligne de Référence n'a pas été définie.")
+
+except Exception as e:
+    print(f"Erreur lors de la saisie ({e}). Veuillez relancer le script et entrer des valeurs valides.")
+    sys.exit(1)
+
+
+# ====================================================================
+# --- Figure 1 de référence (Mise à jour avec la Ligne RL) ---
+# ====================================================================
+fig_help, ax_help = plt.subplots(figsize=(10,10))
+ax_help.imshow(proj_axe_x_z, cmap='gray', origin='lower', extent=[0, width, 0, height])
+ax_help.plot(coords_axe_x_xy_lissé[:, 0], coords_axe_x_xy_lissé[:, 1], color='magenta', linewidth=2.5, zorder=5, label=f'Contour Lissé')
+
+# Points de référence
+rl_label = 'Y' if REFERENCE_LINE_AXIS == 1 else 'X'
+ax_help.scatter(BASE_POINT[0], BASE_POINT[1], color='lime', s=200, marker='*', edgecolors='black', zorder=10, label=f'Base Point (BP)')
+
+# Tracé de la Ligne de Référence (RL) en pointillé
+if REFERENCE_LINE_AXIS == 1: # Ligne horizontale (Y=constante)
+    ax_help.axhline(y=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=2, zorder=6, label=f'Ligne Référence (RL: Y={REFERENCE_LINE_VALUE:.0f})')
+else: # Ligne verticale (X=constante)
+    ax_help.axvline(x=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=2, zorder=6, label=f'Ligne Référence (RL: X={REFERENCE_LINE_VALUE:.0f})')
+
+
+coords_label_check = np.argwhere(mask_vol == label_to_check)
+if coords_label_check.size > 0:
+    center_3D_help = np.mean(coords_label_check, axis=0)
+    center_2D_help = np.array([center_3D_help[2], center_3D_help[1]])
+    ax_help.scatter(center_2D_help[0], center_2D_help[1], color='yellow', s=100, marker='o', edgecolors='black', zorder=12, label=f'Exemple Noyau {label_to_check} (Centre)')
+    
+ax_help.set_title(f"Figure 1 (Référence): Projection Axe X avec BP et Ligne de Référence RL ({rl_label} = {REFERENCE_LINE_VALUE:.0f})", fontsize=14)
+ax_help.axis("equal"); ax_help.legend(loc='lower left', fontsize=10)
+plt.tight_layout()
+plt.show(block=True)
+plt.close(fig_help)
+
+# ====================================================================
+# ANGLE CALCULATION
+# ====================================================================
+print(f"\n---  Calcul des angles [0° à 180°]...")
+nuclei_data = []
+skipped_pca_fail = 0
+label_to_check_failed_pca = False
+
+for label_id in unique_labels:
+    coords_nucleus = np.argwhere(mask_vol == label_id)
+    
+    # 1. Calculer PCA (Centre et Vecteur principal non orienté)
+    center_3D, v_pca_3D = get_principal_axes_3D_only(coords_nucleus)
+    center_2D = np.array([center_3D[2], center_3D[1]]) # X, Y (2D)
+
+    if np.all(v_pca_3D == 0):
+        skipped_pca_fail += 1
+        if label_id == label_to_check:
+             label_to_check_failed_pca = True
+        continue
+
+    # 2. Calcul de l'angle avec orientation PCA par la Ligne de Référence (RL)
+    (angle_deg_0_180, intersection_exact,
+     v_tangent_orienté, v_pca_orienté_rl, v_reference_orientation, 
+     v_pca_orienté_tangente) = calculate_angle_0_180_rl_oriented(
+        center_2D, v_pca_3D, REFERENCE_LINE_AXIS, REFERENCE_LINE_VALUE, BASE_POINT, kd_tree_axe_x, coords_axe_x_xy_lissé,
+        TANGENT_WINDOW_SIZE, proj_axe_x_z, TANGENT_ROI_SIZE, height, width
+    )
+
+    # 3. CORRECTION D'ORIENTATION SI ANGLE EST TRÈS PETIT (<= 10°)
+    v_final_axis = v_pca_orienté_rl # Défaut: Axe Long orienté par RL
+    is_corrected = False
+
+    if angle_deg_0_180 <= ANGLE_CORRECTION_THRESHOLD:
+        # Remplacer l'Axe Long par celui orienté par la Tangente X (qui est dans la direction Tangente/BP)
+        v_final_axis = v_pca_orienté_tangente
+        
+        # Recalculer l'angle avec ce nouveau vecteur
+        dot_prod_corrected = np.dot(v_tangent_orienté, v_final_axis)
+        angle_deg_0_180 = np.degrees(np.arccos(np.clip(dot_prod_corrected, -1.0, 1.0)))
+        is_corrected = True
+        
+    # Enregistrement des données (utilisation de v_final_axis et angle_deg_0_180 mis à jour)
+    nuclei_data.append({
+        'id': label_id,
+        'center': center_2D,
+        'v_pca_orienté_rl': v_pca_orienté_rl, # Le PCA initial (orienté par RL)
+        'v_tangent_orienté': v_tangent_orienté,
+        'angle_0_180_final': angle_deg_0_180,
+        'v_final_axis_orienté': v_final_axis, # Le vecteur final utilisé (RL ou Corrigé)
+        'intersection_point': intersection_exact,
+        'v_reference_orientation': v_reference_orientation,
+        'size': len(coords_nucleus),
+        'is_corrected': is_corrected
+    })
+    
+total_analyzed = len(nuclei_data)
+all_angles_0_180_final = np.array([d['angle_0_180_final'] for d in nuclei_data])
+total_angles_for_stats = len(all_angles_0_180_final)
+corrected_count = sum(d['is_corrected'] for d in nuclei_data)
+print(f"---  Calcul terminé. {total_analyzed} noyaux analysés. {skipped_pca_fail} ignorés. {corrected_count} axes corrigés.")
+
+# ====================================================================
+# FIGURES 6-PANEL
+# ====================================================================
+fig = plt.figure(figsize=(22,18))
+rl_info = f"RL({rl_label}={REFERENCE_LINE_VALUE:.0f})"
+fig.suptitle(f"Analyse d'Alignement (Tangente Axe X vs. Axe Long). Correction si angle $\leq {ANGLE_CORRECTION_THRESHOLD}^\circ$.", fontsize=18, y=1.02)
+
+# -----------------------------------------------
+# --- Figure 5 : Rose Plot (Angle FINAL) ---
+# NOTE : Utilisation du gris pour les angles obtus (>90°) comme demandé précédemment.
+# -----------------------------------------------
+ax5 = fig.add_subplot(3,2,5, projection='polar')
+if total_angles_for_stats > 0:
+    angles_deg = all_angles_0_180_final
+    angles_rad = np.radians(angles_deg)
+    min_angle_rad = 0
+    max_angle_rad = np.pi
+
+    bins = np.linspace(min_angle_rad, max_angle_rad, NB_BINS + 1, endpoint=True)
+    counts, _ = np.histogram(angles_rad, bins=bins, density=False)
+    counts_percent = (counts / total_angles_for_stats) * 100
+    random_percent_threshold = 100.0 / NB_BINS
+    widths = np.diff(bins)
+
+    bins_center_rad = bins[:-1] + widths / 2.0
+    acute_indices = np.where(bins_center_rad <= np.pi / 2)[0]
+    obtuse_indices = np.where(bins_center_rad > np.pi / 2)[0]
+
+    # Utilisation de couleurs Rouge (Aigu) et GRIS (Obtus)
+    if acute_indices.size > 0:
+        ax5.bar(bins[:-1][acute_indices], counts_percent[acute_indices],
+                width=widths[acute_indices], bottom=0.0, color='red',
+                edgecolor='black', linewidth=0.5, alpha=0.8,
+                label=r'$0^\circ \leq \theta \leq 90^\circ$ (Aigu)')
+
+    if obtuse_indices.size > 0:
+        ax5.bar(bins[:-1][obtuse_indices], counts_percent[obtuse_indices],
+                width=widths[obtuse_indices], bottom=0.0, color='dimgray', # Changé pour GRIS foncé
+                edgecolor='black', linewidth=0.5, alpha=0.8,
+                label=r'$90^\circ < \theta \leq 180^\circ$ (Obtus)')
+
+    ax5.plot(np.linspace(min_angle_rad, max_angle_rad, 100), np.full(100, random_percent_threshold), color='black', linestyle='--', linewidth=2, zorder=10)
+
+    ax5.set_theta_zero_location("W")
+    ax5.set_theta_direction(-1)
+    ax5.set_thetamin(0); ax5.set_thetamax(180)
+
+    ax5.set_xticks(np.linspace(0, np.pi, 7, endpoint=True))
+    ax5.set_xticklabels([r'$0^\circ$', r'$30^\circ$', r'$60^\circ$', r'$90^\circ$ (Normal)', r'$120^\circ$', r'$150^\circ$', r'$180^\circ$'], fontsize=9)
+
+    max_radius = counts_percent.max() * 1.1 if counts_percent.size > 0 else 5
+    ax5.set_rlim(0, max_radius)
+
+    rticks = np.linspace(0, max_radius, 4)
+    ax5.set_rticks(rticks)
+    ax5.set_yticklabels([f'{r:.0f}%' for r in rticks], fontsize=9)
+    ax5.tick_params(axis='y', pad=10)
+
+    ax5.set_title("Figure 5: Rose Plot Angle final entre Tangente Axe X et Axe Long [0° - 180°]", va='bottom', fontsize=12)
+    ax5.legend(loc='upper right', fontsize=8)
+else:
+    ax5.text(0,0, "Aucun angle calculé. La Figure 5 est donc vide.", ha='center', va='center', fontsize=14, color='red')
+
+# -----------------------------------------------
+# --- Figure 1 : Projection Axe X LISSÉ + Base Point / Reference Line ---
+# -----------------------------------------------
+ax1 = fig.add_subplot(3,2,1)
+ax1.imshow(proj_axe_x_z, cmap='gray', origin='lower', extent=[0, width, 0, height])
+ax1.imshow(proj_mask > 0, cmap='gray_r', origin='lower', alpha=0.3)
+
+# Tracé du contour LISSÉ sur la figure de synthèse
+ax1.plot(coords_axe_x_xy_lissé[:, 0], coords_axe_x_xy_lissé[:, 1], color='magenta', linewidth=2.5, zorder=5, label=f'Contour Lissé')
+ax1.scatter(BASE_POINT[0], BASE_POINT[1], color='lime', s=200, marker='*', edgecolors='black', zorder=10, label=f'Base Point (BP)')
+
+# Ligne de Référence (RL)
+if REFERENCE_LINE_AXIS == 1: # Ligne horizontale (Y=constante)
+    ax1.axhline(y=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=2, zorder=6, label=f'Ligne Référence (RL: Y={REFERENCE_LINE_VALUE:.0f})')
+else: # Ligne verticale (X=constante)
+    ax1.axvline(x=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=2, zorder=6, label=f'Ligne Référence (RL: X={REFERENCE_LINE_VALUE:.0f})')
+
+if coords_label_check.size > 0:
+    coords_label_check_temp = np.argwhere(mask_vol == label_to_check)
+    if coords_label_check_temp.size > 0:
+        center_3D_temp = np.mean(coords_label_check_temp, axis=0)
+        center_2D_temp = np.array([center_3D_temp[2], center_3D_temp[1]])
+        ax1.scatter(center_2D_temp[0], center_2D_temp[1], color='yellow', s=100, marker='o', edgecolors='black', zorder=12, label=f'Exemple Noyau {label_to_check} (Centre)')
+        
+ax1.set_title(f"Figure 1: Axe X LISSÉ avec {rl_info}", fontsize=12)
+ax1.axis("equal"); ax1.legend(loc='lower left', fontsize=10)
+
+# -----------------------------------------------
+# --- Figure 2 : Détail Axe Long Cellule label_to_check (Axe Long orienté par RL ou Corrigé) ---
+# -----------------------------------------------
+ax2 = fig.add_subplot(3,2,2)
+data_f2 = next((d for d in nuclei_data if d['id']==label_to_check), None)
+
+if data_f2 is None:
+    error_text = f"Cellule {label_to_check} non trouvée ou non calculable."
+    if label_to_check_failed_pca:
+          error_text += "\n(PCA échoué - Noyau trop petit?)"
+    ax2.text(0.5,0.5, error_text, ha='center', va='center', fontsize=14, color='red')
+    ax2.axis('off')
+else:
+    center_2D_f2 = data_f2['center']
+    v_final_axis = data_f2['v_final_axis_orienté']
+    intersection_exact = data_f2['intersection_point']
+    is_corrected = data_f2['is_corrected']
+    v_ref_orient_text = "Loin de RL"
+    
+    if is_corrected:
+        v_ref_orient_text = "Corrigé (selon Tangente X)"
+        quiver_color = 'red'
+    else:
+        quiver_color = 'red'
+
+    ax2.imshow(proj_mask > 0, cmap='gray_r', alpha=0.3, origin='lower')
+
+    line_length = 200
+    line_color = 'orange'
+    pca_vis_length = 150
+    
+    # Ligne de l'axe long
+    ax2.plot([center_2D_f2[0] - v_final_axis[0] * line_length / 2, center_2D_f2[0] + v_final_axis[0] * line_length / 2],
+             [center_2D_f2[1] - v_final_axis[1] * line_length / 2, center_2D_f2[1] + v_final_axis[1] * line_length / 2],
+             color=line_color, linestyle='--', linewidth=2, zorder=6, label=f'Axe Long (Ligne)')
+
+    # Vecteur Axe Long Orienté
+    ax2.quiver(center_2D_f2[0], center_2D_f2[1], v_final_axis[0], v_final_axis[1], color=quiver_color, scale=1 / pca_vis_length, scale_units='xy', angles='xy', **dict(width=0.005, headwidth=8, headlength=12), zorder=7, 
+              label=f'Axe Long Orienté ({v_ref_orient_text})')
+    
+    # Ligne de Référence (RL)
+    if REFERENCE_LINE_AXIS == 1: 
+        ax2.axhline(y=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=1.5, zorder=6)
+    else: 
+        ax2.axvline(x=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=1.5, zorder=6)
+        
+    ax2.scatter(BASE_POINT[0], BASE_POINT[1], color='lime', s=150, marker='*', edgecolors='black', zorder=10, label=f'Base Point Global')
+    ax2.scatter(center_2D_f2[0], center_2D_f2[1], color='orange', s=50, marker='o', edgecolors='black', zorder=9, label='Centre du Noyau')
+    ax2.scatter(intersection_exact[0], intersection_exact[1], color='blue', s=50, marker='X', edgecolors='black', zorder=11, label='Ancrage Tangente')
+
+    ax2.set_title(f"Figure 2: Axe Long Orienté - ID: {label_to_check} ({v_ref_orient_text})", fontsize=12)
+    ax2.axis("equal"); ax2.legend(loc='lower left', fontsize=8)
+
+# -----------------------------------------------
+# --- FIGURE 3 : Angle Cellule label_to_check (Origines Réelles) ---
+# -----------------------------------------------
+ax3 = fig.add_subplot(3,2,3)
+if data_f2 is None:
+    error_text = f"Mesure angle non disponible."
+    if label_to_check_failed_pca:
+          error_text += "\n(Noyau trop petit pour PCA)"
+    ax3.text(0.5,0.5, error_text, ha='center', va='center', fontsize=14, color='red')
+    ax3.axis('off')
+else:
+    center_2D_f2 = data_f2['center']
+    v_final_axis_orienté = data_f2['v_final_axis_orienté']
+    v_tangent_orienté = data_f2['v_tangent_orienté']
+    angle_deg_0_180 = data_f2['angle_0_180_final']
+    anchor_point = data_f2['intersection_point']
+    is_corrected = data_f2['is_corrected']
+    
+    # --- VECTEUR TANGENT INITIAL POUR LE DIAGNOSTIC ---
+    i_pixel_final_anchor = kd_tree_axe_x.query(anchor_point)[1]
+    window_size = TANGENT_WINDOW_SIZE
+    N_lissé = len(coords_axe_x_xy_lissé)
+    idx_prev = (i_pixel_final_anchor - window_size) % N_lissé
+    idx_next = (i_pixel_final_anchor + window_size) % N_lissé
+    v_tangent_unnorm = (coords_axe_x_xy_lissé[idx_next] - coords_axe_x_xy_lissé[idx_prev]).astype(float)
+    norm_tangent = np.linalg.norm(v_tangent_unnorm)
+    v_tangent_initial_norm = v_tangent_unnorm / norm_tangent if norm_tangent > 1e-6 else np.array([1.0, 0.0])
+
+    ax3.imshow(proj_mask > 0, cmap='gray_r', alpha=0.3, origin='lower')
+
+    pca_vis_length = 100
+    
+    # 0. Tangente INITIALE (Direction Locale non orientée)
+    ax3.quiver(anchor_point[0], anchor_point[1], v_tangent_initial_norm[0], v_tangent_initial_norm[1], color='darkorange', scale=1 / pca_vis_length, scale_units='xy', angles='xy', width=0.003, headwidth=4, headlength=7, alpha=0.9, zorder=6, label='Tangente Axe X Initiale')
+
+    # 1. Axe Long orienté (Rouge) - PART DE L'ORIGINE RÉELLE (CENTRE DU NOYAU)
+    ax3.quiver(center_2D_f2[0], center_2D_f2[1], v_final_axis_orienté[0], v_final_axis_orienté[1], color='red', scale=1 / pca_vis_length, scale_units='xy', angles='xy', **dict(width=0.005, headwidth=8, headlength=12), zorder=7, label=f'Axe Long Final (Centre du Noyau)')
+
+    # 2. Tangente Orientée (Magenta) - PART DU POINT D'ANCRAGE
+    ax3.quiver(anchor_point[0], anchor_point[1], v_tangent_orienté[0], v_tangent_orienté[1], color='magenta', scale=1 / pca_vis_length, scale_units='xy', angles='xy', **dict(width=0.005, headwidth=8, headlength=12), alpha=0.9, zorder=7, label='Tangente Axe X Orientée (Ancrage)')
+    
+    # POINTS D'ORIGINE
+    ax3.scatter(center_2D_f2[0], center_2D_f2[1], color='red', s=70, marker='o', edgecolors='black', zorder=10, label='Centre du Noyau (Origine Axe Long)')
+    ax3.scatter(anchor_point[0], anchor_point[1], color='blue', s=70, marker='X', zorder=10, edgecolors='black', label='Point d\'Ancrage (Origine Tangente)')
+
+    
+    # AFFICHAGE DE L'ANGLE (pas d'arc, juste le texte)
+    
+    # Calculer une position pour le texte de l'angle (près du centre du noyau)
+    label_offset = 35 # Distance depuis le centre
+    angle_pca_rad = np.arctan2(v_final_axis_orienté[1], v_final_axis_orienté[0])
+    
+    # Position du texte: légèrement dans la direction du PCA, décalé vers le haut (ou bas)
+    text_x = center_2D_f2[0] + label_offset * np.cos(angle_pca_rad) + 15 * np.cos(angle_pca_rad + np.pi/2)
+    text_y = center_2D_f2[1] + label_offset * np.sin(angle_pca_rad) + 15 * np.sin(angle_pca_rad + np.pi/2)
+    
+    correction_tag = " (Corrigé)" if is_corrected else ""
+    
+    text_color = 'white'
+    text_bg = 'black'
+
+    ax3.text(text_x, text_y, 
+             f"Angle: {angle_deg_0_180:.1f}°" + correction_tag, 
+             color=text_color, fontsize=12, 
+             ha='center', va='center', fontweight='bold', 
+             bbox=dict(facecolor=text_bg, alpha=0.8, edgecolor='none', boxstyle='round,pad=0.2'), 
+             zorder=12)
+
+    # Ligne de Référence (RL)
+    if REFERENCE_LINE_AXIS == 1: 
+        ax3.axhline(y=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=1.5, zorder=6)
+    else: 
+        ax3.axvline(x=REFERENCE_LINE_VALUE, color='red', linestyle='--', linewidth=1.5, zorder=6)
+
+
+    zoom_radius = 80
+    # Centrer le zoom sur le milieu entre le noyau et l'ancrage
+    mid_x = (center_2D_f2[0] + anchor_point[0]) / 2.0
+    mid_y = (center_2D_f2[1] + anchor_point[1]) / 2.0
+    ax3.set_xlim(mid_x - zoom_radius, mid_x + zoom_radius)
+    ax3.set_ylim(mid_y - zoom_radius, mid_y + zoom_radius)
+
+    ax3.set_title(f"Figure 3: Angle : {angle_deg_0_180:.1f}° - Vecteurs à leurs Origines Réelles {correction_tag}", fontsize=12)
+    ax3.axis("equal"); ax3.legend(loc='lower left', fontsize=8)
+
+# -----------------------------------------------
+# --- FIGURE 4 : Map des axes longs (Axe Long - couleur basée sur angle) ---
+# --- MODIFICATION: Flèches TRES ÉPAISSES ---
+# -----------------------------------------------
+ax4 = fig.add_subplot(3,2,4)
+proj_labels = np.max(mask_vol, axis=0)
+ax4.imshow(proj_labels>0, cmap='gray_r', alpha=0.3, origin='lower')
+# Colormap RdBu_r (Rouge-Blanc-Bleu inversé)
+colormap = plt.colormaps.get_cmap('RdBu_r') 
+normalize = plt.Normalize(vmin=0, vmax=180)
+
+if total_analyzed > 0:
+    # Ajustement des paramètres d'épaisseur et de taille de tête
+    # Augmentation significative de la visibilité
+    FLECHE_WIDTH = 0.016 
+    FLECHE_HEADWIDTH = 20
+    FLECHE_HEADLENGTH = 30
+    
+    for d in nuclei_data:
+        c = d['center']
+        a_final = d['angle_0_180_final']
+        v_final = d['v_final_axis_orienté']
+
+        ax4.quiver(c[0], c[1],
+                   v_final[0], v_final[1],
+                   color=colormap(normalize(a_final)), 
+                   scale=1/VISUAL_VECTOR_LENGTH, 
+                   scale_units='xy', 
+                   angles='xy', 
+                   width=FLECHE_WIDTH,       # Épaisseur AUGMENTÉE
+                   headwidth=FLECHE_HEADWIDTH,       # Tête plus LARGE
+                   headlength=FLECHE_HEADLENGTH,     # Tête plus LONGUE
+                   zorder=7)
+
+    # Ligne de Référence (RL)
+    if REFERENCE_LINE_AXIS == 1: 
+        ax4.axhline(y=REFERENCE_LINE_VALUE, color='black', linestyle='--', linewidth=2, zorder=6, alpha=0.7)
+    else: 
+        ax4.axvline(x=REFERENCE_LINE_VALUE, color='black', linestyle='--', linewidth=2, zorder=6, alpha=0.7)
+
+
+    ax4.set_title(f"Figure 4: Axes Longs finaux (RL ou Corrigé) - Flèches TRES ÉPAISSES", fontsize=12)
+    ax4.axis("equal")
+
+    cbar = fig.colorbar(cm.ScalarMappable(norm=normalize, cmap=colormap), ax=ax4, orientation='vertical', shrink=0.7)
+    cbar.set_ticks(np.linspace(0, 180, 7));
+    cbar.set_label("Angle entre Tangente Axe X et Axe Long (0° à 180°)", fontsize=10)
+else:
+    ax4.text(0.5, 0.5, "Aucun axe calculé pour la Map (Problème PCA global).", ha='center', va='center', fontsize=14, color='red')
+    ax4.axis('off')
+
+# --- Figure 6 : Stats ---
+ax6 = fig.add_subplot(3,2,6)
+ax6.axis('off')
+if total_angles_for_stats > 0:
+    mean_angle_0_180 = np.mean(all_angles_0_180_final)
+    std_angle_0_180 = np.std(all_angles_0_180_final)
+    max_freq = counts_percent.max() if 'counts_percent' in locals() and counts_percent.size > 0 else 0
+    random_percent_threshold = 100.0 / NB_BINS
+
+    stats_text = (
+        f"--- Global Angle Statistics (Angle entre Tangente Axe X et Axe Long [0° à 180°]) ---\n"
+        f"Axe X : **LISSÉ** (Décalage {NEW_DECALAGE_PIXEL}px, Lissage W={SMOOTHING_CONTOUR_WINDOW})\n"
+        f"Ancrage Tangente par Intensité Max (ROI: {TANGENT_ROI_SIZE}px) sur contour lissé\n"
+        f"Fenêtre Tangente utilisée (sur ligne LISSÉE) : {TANGENT_WINDOW_SIZE}\n"
+        f"LOGIQUE AXE LONG (PAR DÉFAUT) : Orienté **Loin de la Ligne de Référence (RL)** : {rl_info}.\n"
+        f"LOGIQUE DE CORRECTION : Si Angle <= **{ANGLE_CORRECTION_THRESHOLD:.1f}°**, l'Axe Long est **forcé dans la direction de la Tangente X (vers BP)**.\n"
+        f"Noyaux Analysés : {total_analyzed}\n"
+        f"Noyaux Ignorés (PCA fail/Small) : {skipped_pca_fail}\n"
+        f"Noyaux dont l'Axe Long a été corrigé : **{corrected_count}**\n"
+        f"Mean Angle Final : {mean_angle_0_180:.2f}°\n"
+        f"Standard Deviation Final : {std_angle_0_180:.2f}°\n"
+        f"Max Frequency Observed (Rose Plot) : {max_freq:.2f} %\n"
+        f"Theoretical Random Frequency ({NB_BINS} bins) : {random_percent_threshold:.2f} %\n"
+    )
+    ax6.text(0.01, 0.99, stats_text, transform=ax6.transAxes, fontsize=11, verticalalignment='top', bbox=dict(boxstyle="round,pad=0.6", fc="lightblue", alpha=0.5))
+else:
+    ax6.text(0.5, 0.5, f"Échec de l'analyse globale. {skipped_pca_fail} noyaux ignorés (PCA).", ha='center', va='center', fontsize=14, color='red')
+
+import numpy as np
+import tifffile as tiff
+import matplotlib.pyplot as plt
+from scipy.spatial import KDTree
+import pandas as pd
+import os
+
+# ====================================================================
+# CONFIGURATION
+# ====================================================================
+MAX_DIST_PIXELS = 110  # distance max pour considérer un voisin
+
+# ---------------- PARAMÈTRES POUR VECTEURS 2D -----------------------
+# Ici on simule des vecteurs aléatoires pour chaque cellule
+# Remplace par tes vecteurs réels si tu les as déjà
+np.random.seed(0)
+
+# --------------------------------------------------------------------
+# CHARGEMENT DES DONNÉES
+# --------------------------------------------------------------------
+mask_vol = tiff.imread(mask_file)
+unique_labels = np.unique(mask_vol)
+unique_labels = unique_labels[unique_labels != 0]
+
+coords = []
+labels_valides = []
+for label_id in unique_labels:
+    voxels = np.argwhere(mask_vol == label_id)
+    if voxels.size > 0:
+        centroid = np.mean(voxels, axis=0)  # [Z,Y,X]
+        coords.append(centroid)
+        labels_valides.append(label_id)
+
+coords = np.array(coords)
+
+# --------------------------------------------------------------------
+# VECTEURS BASÉS SUR L'AXE LONG (PCA)
+# --------------------------------------------------------------------
+from sklearn.decomposition import PCA
+
+vectors = []
+
+for label_id in labels_valides:
+    voxels = np.argwhere(mask_vol == label_id)
+    
+    if len(voxels) > 5:  # sécurité pour cellules très petites
+        pca = PCA(n_components=3)
+        pca.fit(voxels)
+        principal_axis = pca.components_[0]  # axe principal
+        principal_axis = principal_axis / np.linalg.norm(principal_axis)
+        vectors.append(principal_axis)
+    else:
+        vectors.append(np.array([0,0,0]))  # fallback si trop petite
+
+vectors = np.array(vectors)
+
+# --------------------------------------------------------------------
+# FIGURE 1 : Voisins 3D d'une cellule cible
+# --------------------------------------------------------------------
+LABEL_CIBLE = 34
+fig1 = plt.figure(figsize=(10, 8))
+ax1 = fig1.add_subplot(111, projection='3d')
+ax1.set_title(f"Voisins 3D de la cellule {LABEL_CIBLE}", fontsize=14)
+
+tree = KDTree(coords)
+idx_target = labels_valides.index(LABEL_CIBLE)
+target = coords[idx_target]
+distances = np.linalg.norm(coords - target, axis=1)
+idxs = np.where((distances > 0) & (distances < MAX_DIST_PIXELS))[0]
+neighbors = coords[idxs]
+
+ax1.scatter(coords[:, 2], coords[:, 1], coords[:, 0],
+            c='lightgrey', s=20, alpha=0.2, label='Toutes cellules')
+ax1.scatter(neighbors[:, 2], neighbors[:, 1], neighbors[:, 0],
+            c='blue', s=40, alpha=0.6, label='Voisins proches')
+ax1.scatter(target[2], target[1], target[0],
+            c='red', s=60, label='Cellule cible')
+ax1.set_xlabel('X'); ax1.set_ylabel('Y'); ax1.set_zlabel('Z')
+ax1.legend()
+plt.tight_layout()
+plt.show()
+
+print(f" {len(neighbors)} voisins trouvés pour le label {LABEL_CIBLE} (< {MAX_DIST_PIXELS} px)")
+
+# --------------------------------------------------------------------
+# FIGURE 2 : Comparaison vecteurs 3D (produit scalaire ABS)
+# --------------------------------------------------------------------
+target_vec = vectors[idx_target]
+v_neighbors = vectors[idxs]
+
+fig2 = plt.figure(figsize=(10, 8))
+ax2 = fig2.add_subplot(111, projection='3d')
+ax2.set_title("Comparaison des vecteurs en 3D (|produit scalaire|)", fontsize=14)
+
+# cellule cible
+ax2.quiver(target[2], target[1], target[0],
+           target_vec[2], target_vec[1], target_vec[0],
+           color='red', length=5, normalize=True, label='Cellule cible')
+
+# voisins
+for i, vec in enumerate(v_neighbors):
+    neighbor_pos = neighbors[i]
+
+    # produit scalaire en valeur absolue
+    dot_abs = np.abs(np.dot(target_vec, vec))
+
+    color = 'green' if dot_abs > 0.9 else 'orange' if dot_abs > 0.5 else 'blue'
+
+    ax2.quiver(neighbor_pos[2], neighbor_pos[1], neighbor_pos[0],
+               vec[2], vec[1], vec[0],
+               color=color, length=5, normalize=True)
+
+ax2.scatter(target[2], target[1], target[0], color='red', s=60)
+ax2.scatter(neighbors[:,2], neighbors[:,1], neighbors[:,0], color='blue', s=40, alpha=0.5)
+
+ax2.set_xlabel("X")
+ax2.set_ylabel("Y")
+ax2.set_zlabel("Z")
+
+plt.tight_layout()
+plt.show()
+
+# --------------------------------------------------------------------
+# CALCUL PRODUIT SCALAIRE POUR TOUTES LES CELLULES ET EXPORT EXCEL
+# --------------------------------------------------------------------
+records = []
+tree = KDTree(coords)
+
+for i, label in enumerate(labels_valides):
+    target_pos = coords[i]
+    target_vec = vectors[i]
+
+    distances, idxs = tree.query(target_pos, k=len(coords))
+    neighbors_idx = [j for j,d in zip(idxs,distances) if 0 < d < MAX_DIST_PIXELS]
+
+    for n_idx in neighbors_idx:
+        neighbor_label = labels_valides[n_idx]
+        neighbor_vec = vectors[n_idx]
+
+        # produit scalaire ABS en 3D
+        dot_abs = np.abs(np.dot(target_vec, neighbor_vec))
+
+        records.append({
+            'Cellule': label,
+            'Voisin': neighbor_label,
+            'ProduitScalaireAbs': dot_abs
+        })
+
+df = pd.DataFrame(records)
+
+excel_file = os.path.join(os.path.dirname(mask_file), "alignement_voisins.xlsx")
+df.to_excel(excel_file, index=False)
+
+print(f" Fichier Excel enregistré : {excel_file}")
+
+# --------------------------------------------------------------------
+# FIGURE 3 : Pourcentage des types d’alignement
+# --------------------------------------------------------------------
+df['Alignement'] = df['ProduitScalaireAbs'].apply(
+    lambda x: 'Parallèle' if x > 0.7 else ('Moyen' if x > 0.4 else 'Perpendiculaire')
+)
+
+counts = df['Alignement'].value_counts()
+pourcentages = counts / counts.sum() * 100
+
+colors = {'Parallèle':'green', 'Moyen':'orange', 'Perpendiculaire':'blue'}
+
+fig3, ax3 = plt.subplots(figsize=(6,6))
+ax3.bar(pourcentages.index, pourcentages.values,
+        color=[colors[c] for c in pourcentages.index])
+
+ax3.set_ylabel('Pourcentage de duos (%)')
+ax3.set_title('Répartition des alignements entre voisins')
+ax3.set_ylim(0, 100)
+ax3.grid(axis='y')
+
+plt.tight_layout()
+plt.show()
+
+# -----------------------------------------------
+# Sauvegarde et affichage
+# -----------------------------------------------
+plt.tight_layout(rect=[0,0,1,0.98])
+fig.savefig(os.path.join(output_dir, f"Full_Synthesis_ANGLE_TANGENTE_AXE_LONG_ORIGINES_REELLES_LABEL_{label_to_check}_FLECHES_TRES_EPAISSES.png"), dpi=300, facecolor='white')
+print(f" Figures sauvegardées dans {output_dir}")
+
+# ====================================================================
+# SAVE CSV
+# ====================================================================
+df_results = pd.DataFrame([{
+    'Label_ID': d['id'],
+    'Center_X': f"{d['center'][0]:.2f}",
+    'Center_Y': f"{d['center'][1]:.2f}",
+    'Reference_Line_Axis': rl_label,
+    'Reference_Line_Value': f"{REFERENCE_LINE_VALUE:.2f}",
+    'Angle_Tangente_Axe_Long_0_180': f"{d['angle_0_180_final']:.2f}",
+    'Taille_Voxels': d['size'],
+    'Axe_Long_Est_Corrige': d['is_corrected']} for d in nuclei_data])
+
+if not df_results.empty:
+    # Mise à jour du nom du fichier CSV pour refléter la correction
+    output_csv_file = os.path.join(path, f"Angle_Measures_TANGENTE_AXE_LONG_CORRECTED_{ANGLE_CORRECTION_THRESHOLD:.0f}_RL_{rl_label}{REFERENCE_LINE_VALUE:.0f}.csv")
+    df_results.to_csv(output_csv_file, index=False)
+    print(f" {len(df_results)} mesures sauvegardées dans CSV : {output_csv_file}")
+else:
+    print(" Aucun noyau n'a été analysé.")
+
+plt.show()
